@@ -1,0 +1,184 @@
+import asyncio
+import base64
+import csv
+import io
+import json
+from datetime import timedelta
+
+import mistralai.workflows as workflows
+from mistralai.workflows import Depends
+from mistralai.workflows.plugins.mistralai.connectors import (
+    ToolCallClient,
+    connector,
+    uses_connectors,
+)
+
+SPREADSHEET_ID = "1OgQuArpsL4UXrpb8HrDAQ8SR8bIpBguZU-95-e5CryM"
+STATE_FILE_TITLE = "воркфлоу-розсилка-стан.json"
+NOTIFY_EMAIL = "shapoval.nataliia@edu.kpi.ua"
+
+gmail = connector("gmail", run_as="deployment")
+drive = connector("google_drive_mcp", run_as="deployment")
+
+
+def _json_text(result) -> str:
+    if isinstance(result, dict):
+        for key in ("text", "content", "result"):
+            value = result.get(key)
+            if isinstance(value, str):
+                return value
+    if isinstance(result, str):
+        return result
+    content = getattr(result, "content", None) or []
+    for item in content:
+        text = getattr(item, "text", None)
+        if isinstance(text, str):
+            return text
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                return item["text"]
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+async def _download_text(drive: ToolCallClient, file_id: str) -> str:
+    result = await drive.call_tool(
+        tool_name="download_file_content",
+        arguments={"file_id": file_id, "export_mime_type": "text/csv"},
+    )
+    text = _json_text(result)
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return text
+    if isinstance(payload, dict) and isinstance(payload.get("content"), str):
+        return base64.b64decode(payload["content"]).decode("utf-8", errors="replace")
+    return text
+
+
+def _row_hash(cells: list[str]) -> str:
+    return base64.b64encode("\x1f".join(cells).encode("utf-8")).decode("ascii")
+
+
+@workflows.activity(start_to_close_timeout=timedelta(seconds=60))
+async def read_processed_rows(
+    drive: ToolCallClient = Depends(drive),
+) -> dict:
+    result = await drive.call_tool(
+        tool_name="search_files",
+        arguments={"query": f"title = '{STATE_FILE_TITLE}'", "page_size": 1},
+    )
+    parsed = json.loads(_json_text(result))
+    files = parsed.get("files", []) if isinstance(parsed, dict) else []
+    if not files:
+        return {"file_id": None, "processed": []}
+    file_id = files[0]["id"]
+    content = await _download_text(drive, file_id)
+    try:
+        state = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        state = {"processed": []}
+    return {"file_id": file_id, "processed": state.get("processed", []) or []}
+
+
+@workflows.activity(start_to_close_timeout=timedelta(seconds=60))
+async def save_processed_rows(
+    file_id: str | None,
+    processed: list[str],
+    drive: ToolCallClient = Depends(drive),
+) -> str:
+    content = json.dumps(
+        {"processed": sorted(set(processed))}, ensure_ascii=False, indent=2
+    )
+    if file_id:
+        await drive.call_tool(
+            tool_name="update_file",
+            arguments={
+                "file_id": file_id,
+                "text_content": content,
+                "content_mime_type": "text/plain",
+            },
+        )
+        return file_id
+    created = await drive.call_tool(
+        tool_name="create_file",
+        arguments={
+            "title": STATE_FILE_TITLE,
+            "text_content": content,
+            "content_mime_type": "text/plain",
+        },
+    )
+    parsed = json.loads(_json_text(created))
+    return (parsed or {}).get("id") or file_id
+
+
+@workflows.activity(start_to_close_timeout=timedelta(seconds=60))
+async def new_sheet_rows(drive: ToolCallClient = Depends(drive)) -> list[list[str]]:
+    csv_text = await _download_text(drive, SPREADSHEET_ID)
+    reader = csv.reader(io.StringIO(csv_text))
+    rows = [row for row in reader if any((cell or "").strip() for cell in row)]
+    if not rows:
+        return []
+    return [row for row in rows[1:]]
+
+
+@workflows.activity(start_to_close_timeout=timedelta(seconds=120))
+async def send_new_row_email(
+    row: list[str],
+    gmail_client: ToolCallClient = Depends(gmail),
+) -> str:
+    headers = ["пошта", "ПІБ", "статус"]
+    pairs = list(zip(headers, [(cell or "").strip() for cell in row]))
+    subject = "Новий рядок у таблиці «Воркфлоу з розсилкою»"
+    lines = "\n".join(f"• {k}: {v if v else '—'}" for k, v in pairs)
+    body = f"У таблиці з'явився новий рядок:\n\n{lines}"
+    html = (
+        "<p>У таблиці з'явився новий рядок:</p><ul>"
+        + "".join(f"<li><b>{k}:</b> {v if v else '—'}</li>" for k, v in pairs)
+        + "</ul>"
+    )
+    await gmail_client.call_tool(
+        tool_name="send_email",
+        arguments={
+            "to": [NOTIFY_EMAIL],
+            "subject": subject,
+            "body": body,
+            "htmlBody": html,
+        },
+    )
+    return "sent"
+
+
+@workflows.workflow.define(
+    name="sheet-to-gmail",
+    workflow_display_name="Google Таблиця → Gmail",
+    workflow_description=(
+        "Щогодини читає таблицю «Воркфлоу з розсилкою» і надсилає листа з даними "
+        "кожного нового рядка."
+    ),
+)
+@uses_connectors(gmail, drive)
+class SheetToGmailWorkflow:
+    @workflows.workflow.entrypoint
+    async def run(self) -> str:
+        state = await read_processed_rows()
+        file_id = state["file_id"]
+        processed = state["processed"]
+
+        rows = await new_sheet_rows()
+        fresh = [row for row in rows if _row_hash(row) not in processed]
+
+        for row in fresh:
+            await send_new_row_email(row)
+            processed.append(_row_hash(row))
+            await save_processed_rows(file_id, processed)
+
+        return f"rows={len(rows)} sent={len(fresh)}"
+
+
+async def main() -> None:
+    await workflows.run_worker([SheetToGmailWorkflow])
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
